@@ -2,24 +2,74 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from ..metadata import PromptMetadataSchema
-from ..validators import OptionalValidatedEmail
+from ..validators import (
+    OptionalValidatedEmail,
+    ValidatedPromptHandle,
+    validate_prompt_data_value,
+)
 
 
 class SaveTempPromptRequest(BaseModel):
-    """Save a temporary (draft) prompt for later review or promotion."""
+    """
+    Save a temporary (draft) prompt for later review or promotion.
 
-    prompt_handle: Optional[str] = Field(None, description="Prompt handle / collection name")
-    sub_agent: Optional[str] = Field(None, description="Sub-agent mapped to the prompt")
-    user_email: OptionalValidatedEmail = Field(None, description="User email for audit trail")
+    Temp prompts auto-expire (TTL controlled by TEMP_PROMPT_RETENTION_MINUTES).
+    Use /commit to persist permanently.
+
+    Mandatory fields  : metadata, prompt_data
+    Optional fields   : prompt_handle, user_email, description,
+                        original_environment, original_version
+    """
+
+    # ── Mandatory ─────────────────────────────────────────────────────────────
     metadata: PromptMetadataSchema = Field(
-        ..., description="Prompt ownership and runtime metadata"
+        ...,
+        description="[REQUIRED] Prompt ownership and runtime metadata.",
     )
-    prompt_data: Dict[str, Any] = Field(..., description="Prompt payload / JSON structure")
-    description: Optional[str] = Field(None, description="Human-readable description")
+    prompt_data: Dict[str, Any] = Field(
+        ...,
+        description="[REQUIRED] Prompt payload as a JSON object. Must not be empty.",
+    )
+
+    # ── Optional ──────────────────────────────────────────────────────────────
+    prompt_handle: ValidatedPromptHandle = Field(
+        None,
+        description="[OPTIONAL] Slug for this prompt. Auto-generated if omitted.",
+    )
+    sub_agent: Optional[str] = Field(
+        None,
+        description="[OPTIONAL] Sub-agent identifier.",
+    )
+    user_email: OptionalValidatedEmail = Field(
+        None,
+        description="[OPTIONAL] User email for audit trail. Strongly recommended.",
+    )
+    description: Optional[str] = Field(
+        None,
+        description="[OPTIONAL] Human-readable description.",
+    )
     original_environment: Optional[str] = Field(
-        None, description="Source environment reference"
+        None,
+        description="[OPTIONAL] Source environment this draft was derived from.",
     )
-    original_version: Optional[int] = Field(None, description="Source prompt version")
+    original_version: Optional[int] = Field(
+        None,
+        ge=1,
+        description="[OPTIONAL] Source prompt version this draft is based on.",
+    )
+
+    # ── Field-level validators ─────────────────────────────────────────────────
+    @field_validator("prompt_data", mode="after")
+    @classmethod
+    def check_prompt_data(cls, v: Dict[str, Any]) -> Dict[str, Any]:
+        return validate_prompt_data_value(v)
+
+    @field_validator("original_version", mode="before")
+    @classmethod
+    def check_version_positive(cls, v: Optional[int]) -> Optional[int]:
+        if v is not None and v < 1:
+            raise ValueError("original_version must be a positive integer (≥ 1)")
+        return v

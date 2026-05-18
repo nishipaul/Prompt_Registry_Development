@@ -176,6 +176,7 @@ async def read_prompt(request: ReadPromptRequest) -> Any:
 
     result = PromptService.read_prompt(
         request.prompt_handle, request.environment, request.version, request.sub_agent,
+        user_email=None,  # read is unauthenticated; audit still records the handle+env
     )
 
     if not result:
@@ -226,19 +227,23 @@ async def search_prompts(request: SearchPromptRequest) -> SearchResponseSchema:
     Optional: prompt_handle, label, sub_agent.
     """
     filters: Dict[str, Any] = {
-        "agent_name": request.agent_name,
+        "agent_name":     request.agent_name,
         "model_provider": request.model_provider,
-        "model_name": request.model_name,
-        "tenant_id": request.tenant_id,
+        "model_name":     request.model_name,
+        "tenant_id":      request.tenant_id,
         "tenant_feature": request.tenant_feature,
     }
-    if request.label:
-        filters["label"] = request.label
-    if request.sub_agent:
-        filters["sub_agent"] = request.sub_agent
+    if request.label:          filters["label"]          = request.label
+    if request.sub_agent:      filters["sub_agent"]      = request.sub_agent
+    if request.created_by:     filters["created_by"]     = request.created_by
+    if request.version:        filters["version"]        = request.version
+    if request.created_after:  filters["created_after"]  = request.created_after
+    if request.created_before: filters["created_before"] = request.created_before
 
     prompts = PromptService.search_prompts(
-        filters, request.environment, prompt_handle=request.prompt_handle,
+        filters, request.environment,
+        prompt_handle=request.prompt_handle,
+        user_email=None,
     )
     return SearchResponseSchema(
         total_results=len(prompts),
@@ -343,7 +348,9 @@ async def get_all_versions(request: VersionsRequest) -> SearchResponseSchema:
     Optional: sub_agent.
     """
     versions = PromptService.get_all_versions(
-        request.prompt_handle, request.environment, request.sub_agent,
+        request.prompt_handle, request.environment,
+        sub_agent=request.sub_agent,
+        user_email=None,
     )
     if not versions:
         detail: Dict[str, Any] = {

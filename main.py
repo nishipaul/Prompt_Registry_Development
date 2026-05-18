@@ -14,10 +14,12 @@ if _parent_dir not in sys.path:
 from mongodb_db import init_all_connections, stop_cleanup_thread, DatabaseConfig
 from mongodb_db.settings import settings
 from api.routers import router
+from utils.logger import configure_logging
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    configure_logging(debug=settings.DEBUG)
     init_all_connections()
     yield
     stop_cleanup_thread()

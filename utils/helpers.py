@@ -38,50 +38,66 @@ def get_next_version(existing_versions: List[int]) -> int:
 
 
 def build_search_query(filters: Dict[str, Any]) -> Dict[str, Any]:
-    """Translate API filter keys to MongoEngine field paths, dropping empty values."""
+    """
+    Translate API filter keys to MongoEngine field paths, dropping empty values.
+
+    Supports standard metadata filters PLUS:
+      - created_by      : exact match on created_by field
+      - version         : exact version match
+      - created_after   : created_at__gte (datetime)
+      - created_before  : created_at__lt  (datetime)
+    """
     field_mapping: Dict[str, str] = {
-        "agent_name": "metadata__agent_name",
-        "model_provider": "metadata__model_provider",
-        "model_name": "metadata__model_name",
-        "tenant_id": "metadata__tenant_id",
-        "tenant_feature": "metadata__tenant_feature",
-        "label": "metadata__label",
-        "environment": "environment",
-        "prompt_handle": "prompt_handle",
-        "sub_agent": "sub_agent",
-        "created_by": "created_by",
+        "agent_name":      "metadata__agent_name",
+        "model_provider":  "metadata__model_provider",
+        "model_name":      "metadata__model_name",
+        "tenant_id":       "metadata__tenant_id",
+        "tenant_feature":  "metadata__tenant_feature",
+        "label":           "metadata__label",
+        "environment":     "environment",
+        "prompt_handle":   "prompt_handle",
+        "sub_agent":       "sub_agent",
+        "created_by":      "created_by",
+        "version":         "version",
     }
-    return {
+    result: Dict[str, Any] = {
         field_mapping.get(key, key): value
         for key, value in filters.items()
-        if value is not None and value != ""
+        if key not in ("created_after", "created_before")
+        and value is not None
+        and value != ""
     }
+    if filters.get("created_after") is not None:
+        result["created_at__gte"] = filters["created_after"]
+    if filters.get("created_before") is not None:
+        result["created_at__lt"] = filters["created_before"]
+    return result
 
 
 def format_prompt_response(prompt_doc: Any) -> Dict[str, Any]:
     """Serialize a MongoEngine prompt document to an API-safe dict."""
     return {
-        "prompt_handle": prompt_doc.prompt_handle,
-        "version": prompt_doc.version,
-        "sub_agent": prompt_doc.sub_agent,
-        "environment": prompt_doc.environment,
-        "info": getattr(prompt_doc, "info", None),
+        "prompt_handle":  prompt_doc.prompt_handle,
+        "version":        prompt_doc.version,
+        "sub_agent":      prompt_doc.sub_agent,
+        "environment":    prompt_doc.environment,
+        "info":           getattr(prompt_doc, "info", None),
         "metadata": {
-            "tenant_id": prompt_doc.metadata.tenant_id,
-            "tenant_feature": prompt_doc.metadata.tenant_feature,
-            "model_name": prompt_doc.metadata.model_name,
-            "model_provider": prompt_doc.metadata.model_provider,
-            "label": prompt_doc.metadata.label,
-            "agent_name": prompt_doc.metadata.agent_name,
-            "framework": prompt_doc.metadata.framework,
-            "additional_metadata": prompt_doc.metadata.additional_metadata or {},
+            "tenant_id":            prompt_doc.metadata.tenant_id,
+            "tenant_feature":       prompt_doc.metadata.tenant_feature,
+            "model_name":           prompt_doc.metadata.model_name,
+            "model_provider":       prompt_doc.metadata.model_provider,
+            "label":                prompt_doc.metadata.label,
+            "agent_name":           prompt_doc.metadata.agent_name,
+            "framework":            prompt_doc.metadata.framework,
+            "additional_metadata":  prompt_doc.metadata.additional_metadata or {},
         },
-        "prompt_data": prompt_doc.prompt_data,
-        "labels": list(prompt_doc.metadata.label) if prompt_doc.metadata else [],
-        "description": getattr(prompt_doc, "description", None),
-        "tags": getattr(prompt_doc, "tags", None) or {},
-        "created_by": prompt_doc.created_by,
-        "created_at": prompt_doc.created_at,
-        "updated_by": prompt_doc.updated_by,
-        "updated_at": prompt_doc.updated_at,
+        "prompt_data":    prompt_doc.prompt_data,
+        "labels":         list(prompt_doc.metadata.label) if prompt_doc.metadata else [],
+        "description":    getattr(prompt_doc, "description", None),
+        "tags":           getattr(prompt_doc, "tags", None) or {},
+        "created_by":     prompt_doc.created_by,
+        "created_at":     prompt_doc.created_at,
+        "updated_by":     prompt_doc.updated_by,
+        "updated_at":     prompt_doc.updated_at,
     }

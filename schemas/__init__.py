@@ -3,8 +3,12 @@ from .validators import (
     OptionalValidatedEmail,
     ValidatedEmail,
     ValidatedEnvironment,
+    ValidatedPromptHandle,
     validate_email_value,
     validate_environment_value,
+    validate_prompt_data_value,
+    validate_labels_value,
+    validate_prompt_handle_value,
 )
 from .metadata import OperationMetadataSchema, PromptMetadataSchema
 from .base import (
@@ -34,10 +38,14 @@ __all__ = [
     "VALID_ENVIRONMENTS",
     "ValidatedEnvironment",
     "ValidatedEmail",
+    "ValidatedPromptHandle",
     "OptionalValidatedEmail",
     # Public validator functions
     "validate_environment_value",
     "validate_email_value",
+    "validate_prompt_data_value",
+    "validate_labels_value",
+    "validate_prompt_handle_value",
     # Metadata
     "PromptMetadataSchema",
     "OperationMetadataSchema",

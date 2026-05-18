@@ -7,6 +7,7 @@ from .schemas import (
     create_user_temp_prompt_model,
     get_user_temp_collection_name,
 )
+from .audit import create_audit_log_model
 
 __all__ = [
     # Settings
@@ -22,4 +23,6 @@ __all__ = [
     "create_log_model",
     "create_user_temp_prompt_model",
     "get_user_temp_collection_name",
+    # Audit
+    "create_audit_log_model",
 ]

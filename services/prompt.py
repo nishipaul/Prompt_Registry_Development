@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+import time
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -13,12 +15,59 @@ from mongodb_db.schemas import (
     create_user_temp_prompt_model,
     get_user_temp_collection_name,
 )
+from mongodb_db.audit import create_audit_log_model
 from mongodb_db.settings import settings
 from utils import build_search_query, format_prompt_response, generate_prompt_handle
+from utils.logger import get_logger, log_op
+
+logger = get_logger("service.prompt")
 
 
 class PromptService:
     _ttl_ensured: set = set()
+
+    # ------------------------------------------------------------------
+    # Audit helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _audit(
+        *,
+        operation: str,
+        environment: str,
+        prompt_handle: str,
+        user_email: Optional[str] = None,
+        version: Optional[int] = None,
+        sub_agent: Optional[str] = None,
+        status: str = "success",
+        duration_ms: Optional[int] = None,
+        detail: Optional[Dict[str, Any]] = None,
+        error: Optional[str] = None,
+    ) -> None:
+        """Write one entry to the central audit log. Never raises."""
+        if environment == "user_temp":
+            return  # temp operations are not permanently logged
+        try:
+            AuditModel = create_audit_log_model(environment)
+            AuditModel(
+                operation=operation,
+                status=status,
+                user_email=user_email or "unknown",
+                prompt_handle=prompt_handle,
+                environment=environment,
+                version=version,
+                sub_agent=sub_agent,
+                performed_at=datetime.utcnow(),
+                duration_ms=duration_ms,
+                detail=detail or {},
+                error=error,
+            ).save()
+        except Exception as exc:
+            log_op(
+                logger, logging.WARNING,
+                f"Audit log write failed: {exc}",
+                op=operation, user=user_email or "-", handle=prompt_handle, env=environment,
+            )
 
     # ------------------------------------------------------------------
     # Private helpers
@@ -191,8 +240,16 @@ class PromptService:
         environment = validated_data["environment"]
         prompt_handle = validated_data["prompt_handle"]
         sub_agent = validated_data.get("sub_agent")
-        PromptModel = create_env_prompt_model(prompt_handle, environment)
+        user_email = validated_data.get("user_email", "unknown")
+        t0 = time.monotonic()
 
+        log_op(
+            logger, logging.INFO,
+            f"Committing prompt — sub_agent={sub_agent!r}",
+            op="commit", user=user_email, handle=prompt_handle, env=environment,
+        )
+
+        PromptModel = create_env_prompt_model(prompt_handle, environment)
         is_new_sub_agent = bool(
             sub_agent
             and not PromptModel.objects(prompt_handle=prompt_handle, sub_agent=sub_agent).first()
@@ -206,12 +263,32 @@ class PromptService:
             metadata=PromptService.build_metadata(validated_data["metadata"]),
             environment=environment,
             prompt_data=validated_data["prompt_data"],
-            created_by=validated_data["user_email"],
+            created_by=user_email,
             created_at=datetime.utcnow(),
             description=validated_data.get("description"),
             tags=validated_data.get("tags", {}),
         )
         prompt.save()
+
+        duration_ms = int((time.monotonic() - t0) * 1000)
+        log_op(
+            logger, logging.INFO,
+            f"Committed v{version} successfully ({duration_ms} ms)",
+            op="commit", user=user_email, handle=prompt_handle, env=environment,
+        )
+        PromptService._audit(
+            operation="commit",
+            environment=environment,
+            prompt_handle=prompt_handle,
+            user_email=user_email,
+            version=version,
+            sub_agent=sub_agent,
+            duration_ms=duration_ms,
+            detail={
+                "is_new_sub_agent": is_new_sub_agent,
+                "prompt_data_keys": list(validated_data["prompt_data"].keys()),
+            },
+        )
 
         return {
             "success": True,
@@ -222,7 +299,7 @@ class PromptService:
             "is_new_sub_agent": is_new_sub_agent,
             "environment": environment,
             "created_at": prompt.created_at,
-            "committed_by": validated_data["user_email"],
+            "committed_by": user_email,
         }
 
     # ------------------------------------------------------------------
@@ -242,23 +319,23 @@ class PromptService:
                 f"Temp draft — expires {doc.expires_at.isoformat()}" if doc.expires_at else "Temp draft"
             ),
             "metadata": {
-                "tenant_id": meta.tenant_id,
-                "tenant_feature": meta.tenant_feature,
-                "model_name": meta.model_name,
-                "model_provider": meta.model_provider,
-                "label": list(meta.label) if meta.label else [],
-                "agent_name": meta.agent_name,
-                "framework": meta.framework,
+                "tenant_id":           meta.tenant_id,
+                "tenant_feature":      meta.tenant_feature,
+                "model_name":          meta.model_name,
+                "model_provider":      meta.model_provider,
+                "label":               list(meta.label) if meta.label else [],
+                "agent_name":          meta.agent_name,
+                "framework":           meta.framework,
                 "additional_metadata": meta.additional_metadata or {},
             },
-            "prompt_data": doc.prompt_data,
-            "labels": list(meta.label) if meta.label else [],
-            "description": getattr(doc, "description", None),
-            "tags": {},
-            "created_by": doc.user_id,
-            "created_at": doc.created_at,
-            "updated_by": None,
-            "updated_at": None,
+            "prompt_data":  doc.prompt_data,
+            "labels":       list(meta.label) if meta.label else [],
+            "description":  getattr(doc, "description", None),
+            "tags":         {},
+            "created_by":   doc.user_id,
+            "created_at":   doc.created_at,
+            "updated_by":   None,
+            "updated_at":   None,
         }
 
     @staticmethod
@@ -267,8 +344,16 @@ class PromptService:
         environment: str,
         version: Optional[int] = None,
         sub_agent: Optional[str] = None,
+        user_email: Optional[str] = None,
     ) -> Optional[Any]:
         """Return one prompt dict (specific version) or a list (all versions). None if not found."""
+        t0 = time.monotonic()
+        log_op(
+            logger, logging.INFO,
+            f"Reading prompt — version={version} sub_agent={sub_agent!r}",
+            op="read", user=user_email or "-", handle=prompt_handle, env=environment,
+        )
+
         if environment == "user_temp":
             TempModel = create_user_temp_prompt_model(prompt_handle)
             try:
@@ -292,10 +377,35 @@ class PromptService:
             if version is not None:
                 query["version"] = version
                 prompt = PromptModel.objects(**query).first()
-                return format_prompt_response(prompt) if prompt else None
-            prompts = PromptModel.objects(**query).order_by("-version")
-            return [format_prompt_response(p) for p in prompts] or None
-        except Exception:
+                result = format_prompt_response(prompt) if prompt else None
+            else:
+                prompts = PromptModel.objects(**query).order_by("-version")
+                result = [format_prompt_response(p) for p in prompts] or None
+
+            duration_ms = int((time.monotonic() - t0) * 1000)
+            status = "success" if result else "not_found"
+            log_op(
+                logger, logging.INFO,
+                f"Read completed — status={status} ({duration_ms} ms)",
+                op="read", user=user_email or "-", handle=prompt_handle, env=environment,
+            )
+            PromptService._audit(
+                operation="read",
+                environment=environment,
+                prompt_handle=prompt_handle,
+                user_email=user_email,
+                version=version,
+                sub_agent=sub_agent,
+                status=status,
+                duration_ms=duration_ms,
+            )
+            return result
+        except Exception as exc:
+            log_op(
+                logger, logging.ERROR,
+                f"Read failed: {exc}",
+                op="read", user=user_email or "-", handle=prompt_handle, env=environment,
+            )
             return None
 
     @staticmethod
@@ -318,45 +428,88 @@ class PromptService:
 
     @staticmethod
     def search_prompts(
-        filters: Dict[str, Any], environment: str, prompt_handle: Optional[str] = None,
+        filters: Dict[str, Any],
+        environment: str,
+        prompt_handle: Optional[str] = None,
+        user_email: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """Search prompts in one collection (if prompt_handle given) or across all."""
+        t0 = time.monotonic()
+        log_op(
+            logger, logging.INFO,
+            f"Searching — filters={list(filters.keys())} prompt_handle={prompt_handle!r}",
+            op="search", user=user_email or "-", handle=prompt_handle or "*", env=environment,
+        )
+
         if prompt_handle:
             PromptModel = create_env_prompt_model(prompt_handle, environment)
             try:
-                return [
+                results = [
                     format_prompt_response(p)
                     for p in PromptModel.objects(**build_search_query(filters)).order_by("-created_at")
                 ]
             except Exception:
-                return []
+                results = []
+        else:
+            query = build_search_query(filters)
+            results = []
+            for coll_name in PromptService._get_env_collections(environment):
+                Model = create_env_prompt_model(coll_name, environment)
+                try:
+                    results.extend(
+                        format_prompt_response(p)
+                        for p in Model.objects(**query).order_by("-created_at")
+                    )
+                except Exception:
+                    continue
 
-        query = build_search_query(filters)
-        results: List[Dict[str, Any]] = []
-        for coll_name in PromptService._get_env_collections(environment):
-            Model = create_env_prompt_model(coll_name, environment)
-            try:
-                results.extend(
-                    format_prompt_response(p)
-                    for p in Model.objects(**query).order_by("-created_at")
-                )
-            except Exception:
-                continue
+        duration_ms = int((time.monotonic() - t0) * 1000)
+        log_op(
+            logger, logging.INFO,
+            f"Search returned {len(results)} result(s) ({duration_ms} ms)",
+            op="search", user=user_email or "-", handle=prompt_handle or "*", env=environment,
+        )
+        PromptService._audit(
+            operation="search",
+            environment=environment,
+            prompt_handle=prompt_handle or "*",
+            user_email=user_email,
+            status="success",
+            duration_ms=duration_ms,
+            detail={"result_count": len(results), "filters": list(filters.keys())},
+        )
         return results
 
     @staticmethod
     def get_all_versions(
-        prompt_handle: str, environment: str, sub_agent: Optional[str] = None,
+        prompt_handle: str,
+        environment: str,
+        sub_agent: Optional[str] = None,
+        user_email: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         PromptModel = create_env_prompt_model(prompt_handle, environment)
+        log_op(
+            logger, logging.INFO,
+            f"Listing versions — sub_agent={sub_agent!r}",
+            op="versions", user=user_email or "-", handle=prompt_handle, env=environment,
+        )
         try:
             query: Dict[str, Any] = {"prompt_handle": prompt_handle}
             if sub_agent is not None:
                 query["sub_agent"] = sub_agent
-            return [
+            results = [
                 format_prompt_response(p)
                 for p in PromptModel.objects(**query).order_by("-version")
             ]
+            PromptService._audit(
+                operation="versions",
+                environment=environment,
+                prompt_handle=prompt_handle,
+                user_email=user_email,
+                sub_agent=sub_agent,
+                detail={"version_count": len(results)},
+            )
+            return results
         except Exception:
             return []
 
@@ -378,11 +531,18 @@ class PromptService:
         Upsert a prompt into the user's temporary collection.
         MongoDB TTL index on expires_at handles auto-expiry.
         """
+        t0 = time.monotonic()
         try:
             if not prompt_handle:
                 prompt_handle = generate_prompt_handle(
                     metadata.agent_name, metadata.model_provider, metadata.model_name
                 )
+
+            log_op(
+                logger, logging.INFO,
+                "Saving to temp",
+                op="save", user=user_email or "-", handle=prompt_handle, env="user_temp",
+            )
 
             TempModel = create_user_temp_prompt_model(prompt_handle)
             collection_name = get_user_temp_collection_name(prompt_handle)
@@ -414,12 +574,19 @@ class PromptService:
                 ).save()
                 action = "created"
 
+            duration_ms = int((time.monotonic() - t0) * 1000)
             if retention_minutes >= 1440:
                 retention_display = f"{retention_minutes / 1440:.1f} days"
             elif retention_minutes >= 60:
                 retention_display = f"{retention_minutes / 60:.1f} hours"
             else:
                 retention_display = f"{retention_minutes} minutes"
+
+            log_op(
+                logger, logging.INFO,
+                f"Temp prompt {action} ({duration_ms} ms) — expires in {retention_display}",
+                op="save", user=user_email or "-", handle=prompt_handle, env="user_temp",
+            )
 
             return {
                 "success": True,
@@ -440,6 +607,11 @@ class PromptService:
                 ),
             }
         except Exception as e:
+            log_op(
+                logger, logging.ERROR,
+                f"Save temp failed: {e}",
+                op="save", user=user_email or "-", handle=prompt_handle or "-", env="user_temp",
+            )
             return {"success": False, "message": f"Error saving temporary prompt: {e}"}
 
     # ------------------------------------------------------------------
@@ -458,6 +630,13 @@ class PromptService:
         sub_agent: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Read a prompt from an environment DB and save the modified version to temp."""
+        t0 = time.monotonic()
+        log_op(
+            logger, logging.INFO,
+            f"Updating prompt — version={version} sub_agent={sub_agent!r}",
+            op="update", user=user_email or "-", handle=prompt_handle, env=environment,
+        )
+
         PromptModel = create_env_prompt_model(prompt_handle, environment)
         try:
             query: Dict[str, Any] = {"prompt_handle": prompt_handle}
@@ -466,6 +645,11 @@ class PromptService:
             all_docs = list(PromptModel.objects(**query).order_by("-version"))
 
             if not all_docs:
+                log_op(
+                    logger, logging.WARNING,
+                    "Update failed — prompt handle not found",
+                    op="update", user=user_email or "-", handle=prompt_handle, env=environment,
+                )
                 return PromptService._not_found_detail(
                     prompt_handle, environment, tenant_id, tenant_feature
                 )
@@ -500,15 +684,36 @@ class PromptService:
             )
 
             if result["success"]:
+                duration_ms = int((time.monotonic() - t0) * 1000)
                 result["message"] = (
                     f"Prompt read from {environment} (v{existing.version}) and saved to "
                     "temporary collection. Use /commit to save permanently."
                 )
                 result["original_version"] = existing.version
                 result["original_environment"] = environment
+                log_op(
+                    logger, logging.INFO,
+                    f"Update to temp complete ({duration_ms} ms)",
+                    op="update", user=user_email or "-", handle=prompt_handle, env=environment,
+                )
+                PromptService._audit(
+                    operation="update",
+                    environment=environment,
+                    prompt_handle=prompt_handle,
+                    user_email=user_email,
+                    version=version,
+                    sub_agent=sub_agent,
+                    duration_ms=duration_ms,
+                    detail={"patched_fields": list(updates.keys())},
+                )
 
             return result
         except Exception as e:
+            log_op(
+                logger, logging.ERROR,
+                f"Update failed: {e}",
+                op="update", user=user_email or "-", handle=prompt_handle, env=environment,
+            )
             return {"success": False, "message": f"Error updating prompt: {e}"}
 
     # ------------------------------------------------------------------
@@ -526,7 +731,15 @@ class PromptService:
         user_email: Optional[str] = None,
         deletion_reason: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Delete a prompt version and write an audit log entry."""
+        """Delete a prompt version and write both a legacy deletion log and a central audit entry."""
+        t0 = time.monotonic()
+        deleted_by = user_email or "unknown"
+        log_op(
+            logger, logging.WARNING,
+            f"DELETE requested — version={version} sub_agent={sub_agent!r} reason={deletion_reason!r}",
+            op="delete", user=deleted_by, handle=prompt_handle, env=environment,
+        )
+
         PromptModel = create_env_prompt_model(prompt_handle, environment)
         try:
             query: Dict[str, Any] = {"prompt_handle": prompt_handle}
@@ -558,7 +771,8 @@ class PromptService:
                     "hint": "Provide one of the available versions listed above.",
                 }
 
-            deleted_by = user_email or "unknown"
+            deleted_at = datetime.utcnow()
+            # Legacy per-prompt-handle deletion log (kept for backwards compat)
             create_log_model(prompt_handle, environment)(
                 prompt_handle=prompt_to_delete.prompt_handle,
                 version=prompt_to_delete.version,
@@ -569,7 +783,7 @@ class PromptService:
                 original_created_by=prompt_to_delete.created_by,
                 original_created_at=prompt_to_delete.created_at,
                 deleted_by=deleted_by,
-                deleted_at=datetime.utcnow(),
+                deleted_at=deleted_at,
                 deletion_reason=deletion_reason,
                 additional_data={
                     "description": prompt_to_delete.description,
@@ -579,7 +793,38 @@ class PromptService:
 
             deleted_version = prompt_to_delete.version
             deleted_sub_agent = prompt_to_delete.sub_agent
+            meta_snapshot = {
+                "tenant_id":       prompt_to_delete.metadata.tenant_id,
+                "tenant_feature":  prompt_to_delete.metadata.tenant_feature,
+                "model_name":      prompt_to_delete.metadata.model_name,
+                "model_provider":  prompt_to_delete.metadata.model_provider,
+                "label":           list(prompt_to_delete.metadata.label),
+                "agent_name":      prompt_to_delete.metadata.agent_name,
+                "framework":       prompt_to_delete.metadata.framework,
+                "additional_metadata": prompt_to_delete.metadata.additional_metadata or {},
+            }
             prompt_to_delete.delete()
+
+            duration_ms = int((time.monotonic() - t0) * 1000)
+            log_op(
+                logger, logging.WARNING,
+                f"DELETE completed — v{deleted_version} removed ({duration_ms} ms)",
+                op="delete", user=deleted_by, handle=prompt_handle, env=environment,
+            )
+            PromptService._audit(
+                operation="delete",
+                environment=environment,
+                prompt_handle=prompt_handle,
+                user_email=deleted_by,
+                version=deleted_version,
+                sub_agent=deleted_sub_agent,
+                duration_ms=duration_ms,
+                detail={
+                    "deletion_reason": deletion_reason,
+                    "original_created_by": prompt_to_delete.created_by
+                    if hasattr(prompt_to_delete, "created_by") else None,
+                },
+            )
 
             return {
                 "success": True,
@@ -589,17 +834,13 @@ class PromptService:
                 "deleted_environment": environment,
                 "deleted_sub_agent": deleted_sub_agent,
                 "deleted_by": deleted_by,
-                "logged_at": datetime.utcnow(),
-                "metadata": {
-                    "tenant_id": prompt_to_delete.metadata.tenant_id,
-                    "tenant_feature": prompt_to_delete.metadata.tenant_feature,
-                    "model_name": prompt_to_delete.metadata.model_name,
-                    "model_provider": prompt_to_delete.metadata.model_provider,
-                    "label": list(prompt_to_delete.metadata.label),
-                    "agent_name": prompt_to_delete.metadata.agent_name,
-                    "framework": prompt_to_delete.metadata.framework,
-                    "additional_metadata": prompt_to_delete.metadata.additional_metadata or {},
-                },
+                "logged_at": deleted_at,
+                "metadata": meta_snapshot,
             }
         except Exception as e:
+            log_op(
+                logger, logging.ERROR,
+                f"Delete failed: {e}",
+                op="delete", user=deleted_by, handle=prompt_handle, env=environment,
+            )
             return {"success": False, "message": f"Error deleting prompt: {e}"}

@@ -9,19 +9,58 @@ from ..validators import ValidatedEnvironment
 
 
 class ReadPromptRequest(TenantIdentifierSchema):
-    """Fetch a specific prompt by handle, version, and environment."""
+    """
+    Fetch a specific prompt by handle, version, and environment.
 
-    prompt_handle: str = Field(..., description="Prompt handle / collection name")
-    environment: ValidatedEnvironment = Field(..., description="Target environment")
-    version: Optional[int] = Field(
-        None, description="Specific version to retrieve; latest if omitted"
+    Mandatory fields  : prompt_handle, environment, tenant_id, tenant_feature
+    Optional fields   : version (latest if omitted), sub_agent
+    """
+
+    # ── Mandatory ─────────────────────────────────────────────────────────────
+    prompt_handle: str = Field(
+        ...,
+        description="[REQUIRED] Prompt handle / collection name to retrieve.",
     )
-    sub_agent: Optional[str] = Field(None, description="Sub-agent filter")
+    environment: ValidatedEnvironment = Field(
+        ...,
+        description="[REQUIRED] Environment to read from. "
+                    "One of: development | test | uat | production | user_temp",
+    )
+
+    # ── Optional ──────────────────────────────────────────────────────────────
+    version: Optional[int] = Field(
+        None,
+        ge=1,
+        description="[OPTIONAL] Specific version to retrieve. "
+                    "Omit to return ALL versions for this handle.",
+    )
+    sub_agent: Optional[str] = Field(
+        None,
+        description="[OPTIONAL] Filter results to a specific sub-agent.",
+    )
 
 
 class VersionsRequest(TenantIdentifierSchema):
-    """List all available versions of a prompt in a given environment."""
+    """
+    List all available versions of a prompt in a given environment.
 
-    prompt_handle: str = Field(..., description="Prompt handle / collection name")
-    environment: ValidatedEnvironment = Field(..., description="Target environment")
-    sub_agent: Optional[str] = Field(None, description="Sub-agent filter")
+    Mandatory fields  : prompt_handle, environment, tenant_id, tenant_feature
+    Optional fields   : sub_agent
+    """
+
+    # ── Mandatory ─────────────────────────────────────────────────────────────
+    prompt_handle: str = Field(
+        ...,
+        description="[REQUIRED] Prompt handle / collection name.",
+    )
+    environment: ValidatedEnvironment = Field(
+        ...,
+        description="[REQUIRED] Environment to query. "
+                    "One of: development | test | uat | production",
+    )
+
+    # ── Optional ──────────────────────────────────────────────────────────────
+    sub_agent: Optional[str] = Field(
+        None,
+        description="[OPTIONAL] Narrow version list to a specific sub-agent.",
+    )
