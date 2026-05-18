@@ -144,11 +144,21 @@ class PromptService:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _get_existing_sub_agents(prompt_handle: str, environment: str) -> List[Dict[str, Any]]:
-        """Return each distinct sub_agent with its latest version number."""
+    def _get_existing_sub_agents(
+        prompt_handle: str,
+        environment: str,
+        tenant_id: Optional[str] = None,
+        tenant_feature: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """Return each distinct sub_agent (for this tenant) with its latest version number."""
         PromptModel = create_env_prompt_model(prompt_handle, environment)
+        match: Dict[str, Any] = {"prompt_handle": prompt_handle}
+        if tenant_id:
+            match["metadata.tenant_id"] = tenant_id
+        if tenant_feature:
+            match["metadata.tenant_feature"] = tenant_feature
         pipeline = [
-            {"$match": {"prompt_handle": prompt_handle}},
+            {"$match": match},
             {"$sort": {"version": -1}},
             {
                 "$group": {
@@ -177,13 +187,24 @@ class PromptService:
 
     @staticmethod
     def _validate_sub_agent(
-        prompt_handle: str, sub_agent: str, environment: str,
+        prompt_handle: str,
+        sub_agent: str,
+        environment: str,
+        tenant_id: Optional[str] = None,
+        tenant_feature: Optional[str] = None,
     ) -> Tuple[bool, Optional[Dict[str, Any]]]:
-        """Return (True, None) if sub_agent exists or the collection is empty."""
+        """Return (True, None) if sub_agent exists for this tenant, or the collection is empty."""
         PromptModel = create_env_prompt_model(prompt_handle, environment)
-        if PromptModel.objects(prompt_handle=prompt_handle, sub_agent=sub_agent).first():
+        query: Dict[str, Any] = {"prompt_handle": prompt_handle, "sub_agent": sub_agent}
+        if tenant_id:
+            query["metadata__tenant_id"] = tenant_id
+        if tenant_feature:
+            query["metadata__tenant_feature"] = tenant_feature
+        if PromptModel.objects(**query).first():
             return True, None
-        existing = PromptService._get_existing_sub_agents(prompt_handle, environment)
+        existing = PromptService._get_existing_sub_agents(
+            prompt_handle, environment, tenant_id, tenant_feature
+        )
         if not existing:
             return True, None
         return False, {
@@ -201,12 +222,21 @@ class PromptService:
 
     @staticmethod
     def _next_version(
-        prompt_handle: str, environment: str, sub_agent: Optional[str] = None
+        prompt_handle: str,
+        environment: str,
+        sub_agent: Optional[str] = None,
+        tenant_id: Optional[str] = None,
+        tenant_feature: Optional[str] = None,
     ) -> int:
-        """Auto-increment version for a (prompt_handle, sub_agent) pair."""
+        """Auto-increment version for a (prompt_handle, sub_agent, tenant) triple."""
         PromptModel = create_env_prompt_model(prompt_handle, environment)
+        query: Dict[str, Any] = {"prompt_handle": prompt_handle, "sub_agent": sub_agent}
+        if tenant_id:
+            query["metadata__tenant_id"] = tenant_id
+        if tenant_feature:
+            query["metadata__tenant_feature"] = tenant_feature
         latest = (
-            PromptModel.objects(prompt_handle=prompt_handle, sub_agent=sub_agent)
+            PromptModel.objects(**query)
             .order_by("-version")
             .only("version")
             .first()
@@ -219,13 +249,21 @@ class PromptService:
 
     @staticmethod
     def check_existing_prompt(
-        prompt_handle: str, environment: str, sub_agent: Optional[str] = None,
+        prompt_handle: str,
+        environment: str,
+        sub_agent: Optional[str] = None,
+        tenant_id: Optional[str] = None,
+        tenant_feature: Optional[str] = None,
     ) -> Tuple[bool, Optional[Dict]]:
         PromptModel = create_env_prompt_model(prompt_handle, environment)
         try:
             query: Dict[str, Any] = {"prompt_handle": prompt_handle}
             if sub_agent is not None:
                 query["sub_agent"] = sub_agent
+            if tenant_id:
+                query["metadata__tenant_id"] = tenant_id
+            if tenant_feature:
+                query["metadata__tenant_feature"] = tenant_feature
             existing = PromptModel.objects(**query).order_by("-version").first()
             return (True, format_prompt_response(existing)) if existing else (False, None)
         except Exception:
@@ -249,12 +287,22 @@ class PromptService:
             op="commit", user=user_email, handle=prompt_handle, env=environment,
         )
 
+        tenant_id = validated_data["metadata"].get("tenant_id")
+        tenant_feature = validated_data["metadata"].get("tenant_feature")
         PromptModel = create_env_prompt_model(prompt_handle, environment)
+
+        # Check new sub_agent scoped to this tenant only
         is_new_sub_agent = bool(
-            sub_agent
-            and not PromptModel.objects(prompt_handle=prompt_handle, sub_agent=sub_agent).first()
+            sub_agent and not PromptModel.objects(
+                prompt_handle=prompt_handle,
+                sub_agent=sub_agent,
+                metadata__tenant_id=tenant_id,
+                metadata__tenant_feature=tenant_feature,
+            ).first()
         )
-        version = PromptService._next_version(prompt_handle, environment, sub_agent)
+        version = PromptService._next_version(
+            prompt_handle, environment, sub_agent, tenant_id, tenant_feature
+        )
 
         prompt = PromptModel(
             prompt_handle=prompt_handle,
@@ -345,6 +393,8 @@ class PromptService:
         version: Optional[int] = None,
         sub_agent: Optional[str] = None,
         user_email: Optional[str] = None,
+        tenant_id: Optional[str] = None,
+        tenant_feature: Optional[str] = None,
     ) -> Optional[Any]:
         """Return one prompt dict (specific version) or a list (all versions). None if not found."""
         t0 = time.monotonic()
@@ -371,7 +421,12 @@ class PromptService:
 
         PromptModel = create_env_prompt_model(prompt_handle, environment)
         try:
+            # Always scope to the requesting tenant — prevents cross-tenant reads
             query: Dict[str, Any] = {"prompt_handle": prompt_handle}
+            if tenant_id:
+                query["metadata__tenant_id"] = tenant_id
+            if tenant_feature:
+                query["metadata__tenant_feature"] = tenant_feature
             if sub_agent is not None:
                 query["sub_agent"] = sub_agent
             if version is not None:
@@ -486,6 +541,8 @@ class PromptService:
         environment: str,
         sub_agent: Optional[str] = None,
         user_email: Optional[str] = None,
+        tenant_id: Optional[str] = None,
+        tenant_feature: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         PromptModel = create_env_prompt_model(prompt_handle, environment)
         log_op(
@@ -495,6 +552,10 @@ class PromptService:
         )
         try:
             query: Dict[str, Any] = {"prompt_handle": prompt_handle}
+            if tenant_id:
+                query["metadata__tenant_id"] = tenant_id
+            if tenant_feature:
+                query["metadata__tenant_feature"] = tenant_feature
             if sub_agent is not None:
                 query["sub_agent"] = sub_agent
             results = [
@@ -639,7 +700,12 @@ class PromptService:
 
         PromptModel = create_env_prompt_model(prompt_handle, environment)
         try:
+            # Scope query to this tenant to prevent cross-tenant access
             query: Dict[str, Any] = {"prompt_handle": prompt_handle}
+            if tenant_id:
+                query["metadata__tenant_id"] = tenant_id
+            if tenant_feature:
+                query["metadata__tenant_feature"] = tenant_feature
             if sub_agent is not None:
                 query["sub_agent"] = sub_agent
             all_docs = list(PromptModel.objects(**query).order_by("-version"))
@@ -647,7 +713,7 @@ class PromptService:
             if not all_docs:
                 log_op(
                     logger, logging.WARNING,
-                    "Update failed — prompt handle not found",
+                    "Update failed — prompt handle not found for this tenant",
                     op="update", user=user_email or "-", handle=prompt_handle, env=environment,
                 )
                 return PromptService._not_found_detail(
@@ -742,7 +808,12 @@ class PromptService:
 
         PromptModel = create_env_prompt_model(prompt_handle, environment)
         try:
+            # Scope query to this tenant — prevents deleting another tenant's prompts
             query: Dict[str, Any] = {"prompt_handle": prompt_handle}
+            if tenant_id:
+                query["metadata__tenant_id"] = tenant_id
+            if tenant_feature:
+                query["metadata__tenant_feature"] = tenant_feature
             if sub_agent is not None:
                 query["sub_agent"] = sub_agent
             all_docs = list(PromptModel.objects(**query).order_by("-version"))

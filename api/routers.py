@@ -89,7 +89,10 @@ async def commit_prompt(request: CommitPromptRequest) -> CommitResponseSchema:
         other_sub_agents = None
         if sub_agent and result.get("is_new_sub_agent"):
             existing = PromptService._get_existing_sub_agents(
-                validated_data["prompt_handle"], validated_data["environment"],
+                validated_data["prompt_handle"],
+                validated_data["environment"],
+                tenant_id=request.metadata.tenant_id,
+                tenant_feature=request.metadata.tenant_feature,
             )
             others = [s for s in existing if s["sub_agent"] != sub_agent]
             if others:
@@ -169,14 +172,23 @@ async def read_prompt(request: ReadPromptRequest) -> Any:
     """
     if request.sub_agent is not None:
         valid, error_payload = PromptService._validate_sub_agent(
-            request.prompt_handle, request.sub_agent, request.environment,
+            request.prompt_handle,
+            request.sub_agent,
+            request.environment,
+            tenant_id=request.tenant_id,
+            tenant_feature=request.tenant_feature,
         )
         if not valid:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=error_payload)
 
     result = PromptService.read_prompt(
-        request.prompt_handle, request.environment, request.version, request.sub_agent,
-        user_email=None,  # read is unauthenticated; audit still records the handle+env
+        request.prompt_handle,
+        request.environment,
+        request.version,
+        request.sub_agent,
+        user_email=None,
+        tenant_id=request.tenant_id,
+        tenant_feature=request.tenant_feature,
     )
 
     if not result:
@@ -348,9 +360,12 @@ async def get_all_versions(request: VersionsRequest) -> SearchResponseSchema:
     Optional: sub_agent.
     """
     versions = PromptService.get_all_versions(
-        request.prompt_handle, request.environment,
+        request.prompt_handle,
+        request.environment,
         sub_agent=request.sub_agent,
         user_email=None,
+        tenant_id=request.tenant_id,
+        tenant_feature=request.tenant_feature,
     )
     if not versions:
         detail: Dict[str, Any] = {

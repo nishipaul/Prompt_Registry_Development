@@ -1,5 +1,15 @@
 # Architecture Review — Prompt Management Service
-> Assessed: 2026-05-13 | Reviewer: Principal Engineer perspective
+> Originally assessed: 2026-05-13 | Last updated: 2026-05-18 | Reviewer: Principal Engineer perspective
+
+---
+
+## Changelog
+
+| Date | What changed |
+|------|--------------|
+| 2026-05-13 | Initial review — baseline assessment |
+| 2026-05-18 | Structured logging + central audit trail added. Enhanced validations (prompt_data, labels, handle format, version bounds). Search filtration extended. Mandatory/optional field clarity added to all schemas. `version` made required on delete and update. Router stale file removed (already done). |
+| 2026-05-18 | Cross-tenant data isolation fixed — all read/version/update/delete/sub_agent queries now enforce `metadata__tenant_id` + `metadata__tenant_feature`. Version counter also scoped per tenant so two tenants sharing a handle get independent version sequences. |
 
 ---
 
@@ -7,7 +17,7 @@
 
 The codebase has a **solid structural foundation** — clean layering, well-typed schemas, centralised validation, and proper audit machinery. Several production-grade decisions (Pydantic v2 `Annotated` types, `OperationMetadataSchema` on every response, TTL-backed temp storage, per-environment audit logs) reflect real product thinking.
 
-However, it is **not yet shippable to production** as-is. The gaps are not cosmetic — they are in authentication, observability, error handling, data isolation, and concurrency safety. The section below classifies every finding by priority.
+**As of the latest round of changes**, observability and data integrity are materially improved. The system now has structured logging across all service methods, a central audit trail for every CRUD operation, tighter input validation, and full mandatory/optional field documentation on every endpoint. The remaining gaps are authentication, tenant isolation, concurrency safety, and test coverage — none of which were in scope of the last sprint but remain blockers for production.
 
 ---
 
@@ -15,22 +25,55 @@ However, it is **not yet shippable to production** as-is. The gaps are not cosme
 
 | Area | Assessment |
 |------|------------|
-| **Schema layer** | `Annotated[str, AfterValidator(...)]` pattern centralises all validation in one place; zero duplication across request classes. Production-grade. |
+| **Schema layer** | `Annotated[str, AfterValidator(...)]` pattern centralises all validation. Now includes `ValidatedPromptHandle`, `validate_prompt_data_value`, `validate_labels_value`. Zero duplication across request classes. |
+| **Field documentation** | Every field on every request schema now carries `[REQUIRED]` or `[OPTIONAL]` with description and examples. Visible in Swagger UI at `/docs`. |
+| **Structured logging** | `utils/logger.py` — `configure_logging()` wired to `lifespan`, every service method emits `op / user / handle / env` context. DELETE emits at `WARNING`; errors at `ERROR`. |
+| **Central audit trail** | `mongodb_db/audit.py` — `operation_audit_log` collection per environment captures every commit, save, read, search, update, delete, and versions call with `user_email`, `duration_ms`, `status`, and `detail` payload. |
+| **Input validation** | `prompt_data` must be non-empty with string keys. `labels` require ≥ 1 non-empty entry. `prompt_handle` validated against `[a-z0-9][a-z0-9_\-]{0,127}`. `version` enforced `≥ 1` on all endpoints that accept it. |
+| **Search filtration** | `SearchPromptRequest` now accepts `created_after`, `created_before`, `created_by`, `version` filters — translated to MongoEngine range queries in `build_search_query`. |
+| **Version required on delete/update** | `DeletePromptRequest.version` and `UpdatePromptRequest.version` are now `int` (required, `ge=1`). Foot-gun of omitting version removed at schema level. |
 | **Response envelope** | `OperationMetadataSchema` on every mutating response gives audit traceability by design. |
-| **Schema organisation** | `schemas/requests/` and `schemas/responses/` split by operation, one file each. Easy to navigate and extend. |
-| **Validation service** | `ValidationService.resolve_commit_data` cleanly separates business-logic resolution from Pydantic field validation. Correct separation of concerns. |
-| **Temp storage design** | MongoDB TTL index approach for auto-expiry is the right tool. `_ensure_collection_ttl` + background cleanup thread covers both the index and empty-collection hygiene. |
-| **Audit log on delete** | Separate `<env>_logs` database per environment is a good pattern — audit data survives the operational DB. |
-| **Settings** | `pydantic-settings` `BaseSettings` with `.env` support and typed fields is production-standard config management. |
-| **MongoEngine model factory** | `create_env_prompt_model` / `create_log_model` with model caching avoids re-creating classes on every call. |
-| **`lifespan` hook** | Proper startup/shutdown lifecycle — connects DBs, ensures TTL indexes, starts cleanup thread, and tears everything down cleanly. |
-| **Folder layout** | `api/`, `services/`, `schemas/`, `mongodb_db/`, `utils/` separation makes each layer findable. |
+| **Schema organisation** | `schemas/requests/` and `schemas/responses/` split by operation. Easy to navigate and extend. |
+| **Validation service** | `ValidationService.resolve_commit_data` cleanly separates business-logic resolution from Pydantic field validation. |
+| **Temp storage design** | MongoDB TTL index approach for auto-expiry. `_ensure_collection_ttl` + background cleanup thread covers both the index and empty-collection hygiene. |
+| **Audit log on delete** | Separate `<env>_logs` database per environment. Audit data survives the operational DB. Both the legacy per-handle delete log and the new central `operation_audit_log` are written on every delete. |
+| **Settings** | `pydantic-settings` `BaseSettings` with `.env` support. |
+| **MongoEngine model factory** | `create_env_prompt_model` / `create_log_model` / `create_audit_log_model` with model caching. |
+| **`lifespan` hook** | Connects DBs, ensures TTL indexes, starts cleanup thread, configures logging — and tears everything down cleanly. |
 
 ---
 
 ## 3. Critical Issues — Must Fix Before Production (P0)
 
-### 3.1 No Authentication or Authorisation
+### ✅ 3.2 Silent Exception Swallowing — PARTIALLY RESOLVED
+**Files:** `services/prompt.py`
+
+**What was done:** All `except Exception` blocks in the service layer now call `log_op(logger, logging.ERROR, ...)` before returning a fallback value. Errors are no longer silently dropped — they surface in the structured log output.
+
+**Remaining gap:** The helper methods `_get_env_collections`, `_ensure_collection_ttl`, and `_validate_sub_agent` still swallow exceptions silently without logging. These are lower-risk paths but should be brought in line.
+
+---
+
+### ✅ 3.3 No Structured Logging — RESOLVED
+**Files:** `utils/logger.py` (new), `services/prompt.py`, `main.py`
+
+**What was done:**
+- Created `utils/logger.py` with `configure_logging()`, `get_logger()`, and `log_op()`.
+- `configure_logging(debug=settings.DEBUG)` is called in the FastAPI `lifespan` hook at startup.
+- Every service method — `commit_prompt`, `save_temp_prompt`, `read_prompt`, `search_prompts`, `get_all_versions`, `update_prompt`, `delete_prompt` — emits a structured start and completion log line with `op`, `user`, `handle`, and `env` context.
+- DELETE operations log at `WARNING` level to make them immediately visible in any log aggregator.
+- Every log line includes operation timing (`duration_ms`).
+
+Sample output:
+```
+2026-05-18T10:22:01Z | INFO     | pm.service.prompt | op=commit     user=dev@co.com  handle=my-prompt env=development | Committing prompt — sub_agent=None
+2026-05-18T10:22:01Z | INFO     | pm.service.prompt | op=commit     user=dev@co.com  handle=my-prompt env=development | Committed v4 successfully (14 ms)
+2026-05-18T10:22:05Z | WARNING  | pm.service.prompt | op=delete     user=admin@co.com handle=my-prompt env=production  | DELETE requested — version=2 reason='outdated'
+```
+
+---
+
+### ⏳ 3.1 No Authentication or Authorisation — OPEN
 **File:** `api/routers.py`
 
 Every endpoint is open. Any caller can read, overwrite, or delete any tenant's prompts. There is no API key, JWT, OAuth2, or even a shared secret.
@@ -39,49 +82,28 @@ Every endpoint is open. Any caller can read, overwrite, or delete any tenant's p
 
 ---
 
-### 3.2 Silent Exception Swallowing Everywhere
-**Files:** `services/prompt.py` (11 methods), `mongodb_db/database.py`
+### ✅ 3.4 `prompt_handle` Is Not Tenant-Scoped — Cross-Tenant Data Collision — RESOLVED
+**Files:** `services/prompt.py`, `api/routers.py`
 
-Pattern found throughout:
-```python
-except Exception:
-    return []   # or return None / return {}
-```
+**What was done:** Query-level tenant scoping applied across the entire service layer. Every read, version list, update, and delete query now enforces both `metadata__tenant_id` and `metadata__tenant_feature` so a tenant can only see and touch their own prompts — even when two tenants share the same collection (same prompt_handle, same environment).
 
-This silently hides database timeouts, schema errors, query failures, and connection pool exhaustion. In production you will have incidents with no trace of the cause.
+The fix was applied consistently to 8 methods:
+- `_get_existing_sub_agents` — `$match` stage in aggregation pipeline now filters by tenant
+- `_validate_sub_agent` — sub-agent existence check scoped to tenant
+- `_next_version` — version counter scoped per tenant, so each tenant gets an independent sequence starting at v1
+- `check_existing_prompt` — existence check scoped to tenant
+- `read_prompt` — query always includes `metadata__tenant_id` + `metadata__tenant_feature`
+- `get_all_versions` — version list scoped to tenant
+- `update_prompt` — source document lookup scoped to tenant
+- `delete_prompt` — document lookup before deletion scoped to tenant
 
-**Required:** All exceptions must be logged at `ERROR` level before being swallowed or re-raised. Temporary failures (network) should be distinguished from programming errors (wrong field names). Use structured logging (see §3.3).
+The router passes `request.tenant_id` and `request.tenant_feature` through to all service calls. Collection names were intentionally kept as-is (no tenant prefix in name) to preserve backward compatibility with existing data; isolation is enforced at query level rather than storage level.
 
----
-
-### 3.3 No Structured Logging
-**Files:** All
-
-There is not a single `import logging` in the codebase. No request IDs are injected into log context. No DB errors are recorded. No operation timing is measured.
-
-**Required:**
-```python
-import logging
-logger = logging.getLogger(__name__)
-```
-Use `structlog` or configure `logging` with JSON formatter for production. Log at entry and exit of every service method with `prompt_handle`, `environment`, `user_email`, and `request_id` in context. Wire `OperationMetadataSchema.request_id` to a middleware that injects `X-Request-ID` per request.
+**Residual note:** The `user_temp` path in `read_prompt` is scoped by `user_email` (stored as `user_id`) which is already user-specific, so tenant leakage via the temp collection is not possible.
 
 ---
 
-### 3.4 `prompt_handle` Is Not Tenant-Scoped — Cross-Tenant Data Collision
-**Files:** `services/prompt.py`, `mongodb_db/schemas.py`
-
-The auto-generated `prompt_handle` is `{agent_name}_{model_provider}_{model_name}`. Two different tenants with the same agent and model will write to **the same MongoDB collection**. Tenant A can read Tenant B's prompts by knowing the handle.
-
-**Required:** Either:
-- Include `tenant_id` in the collection name: `{tenant_id}_{agent_name}_{model_provider}_{model_name}`
-- Or enforce strict tenant filtering on every query (query always includes `metadata__tenant_id=tenant_id`)
-
-Currently `read_prompt` does NOT filter by `tenant_id` — it only uses `prompt_handle` and optionally `sub_agent`. Any caller who knows a handle can read across tenants.
-
----
-
-### 3.5 Version Assignment Race Condition
+### ⏳ 3.5 Version Assignment Race Condition — OPEN
 **File:** `services/prompt.py` — `_next_version` + `commit_prompt`
 
 ```python
@@ -96,7 +118,7 @@ Two concurrent commits for the same `(prompt_handle, sub_agent)` will both read 
 
 ---
 
-### 3.6 Internal Error Details Exposed to Callers
+### ⏳ 3.6 Internal Error Details Exposed to Callers — OPEN
 **File:** `api/routers.py` — multiple endpoints
 
 ```python
@@ -116,7 +138,7 @@ raise HTTPException(status_code=500, detail="Internal error. See server logs.")
 
 ---
 
-### 3.7 `save_temp_prompt` Accepts `None` for `user_id` — Guaranteed Runtime Failure
+### ⏳ 3.7 `save_temp_prompt` Accepts `None` for `user_id` — OPEN
 **Files:** `api/routers.py`, `services/prompt.py`
 
 `SaveTempPromptRequest.user_email` is `OptionalValidatedEmail` — can be `None`. This flows into `PromptService.save_temp_prompt(user_email=...)` and lands at:
@@ -131,26 +153,37 @@ MongoEngine will raise `ValidationError` at save time with an opaque message.
 
 ## 4. High Priority Issues — Fix Within First Sprint (P1)
 
-### 4.1 No Pagination on Search and Versions
+### ✅ 4.3 Stale `router.py` File — RESOLVED
+The old `router.py` was already replaced by `api/routers.py` in a prior session. Removed.
+
+---
+
+### ✅ 4.8 Delete and Update Accept Missing Version — RESOLVED
+**Files:** `schemas/requests/delete.py`, `schemas/requests/update.py`
+
+**What was done:** `DeletePromptRequest.version` and `UpdatePromptRequest.version` are now `int` (required, `ge=1`). The footgun of passing a request with no version is rejected at Pydantic validation before it reaches the service layer.
+
+---
+
+### ⏳ 4.1 No Pagination on Search and Versions — OPEN
 **File:** `services/prompt.py` — `search_prompts`, `get_all_versions`
 
-Both return all matching documents with no limit. A prompt handle with 500 versions will return 500 documents in one response. Cross-collection search with many handles can return thousands.
+Both return all matching documents with no limit. A prompt handle with 500 versions will return 500 documents in one response.
 
 **Required:** Add `limit: int = 50` and `offset: int = 0` (or `page`/`page_size`) to `SearchPromptRequest`, `VersionsRequest`, and the `SearchResponseSchema`. Apply `.skip(offset).limit(limit)` in the MongoEngine queries.
 
 ---
 
-### 4.2 No Health-Check DB Ping
+### ⏳ 4.2 No Health-Check DB Ping — OPEN
 **File:** `api/routers.py` — `/health`
 
-The health endpoint returns `{"status": "healthy"}` unconditionally. A load balancer or Kubernetes readiness probe relying on this endpoint will route traffic to a pod with a broken MongoDB connection.
+The health endpoint returns `{"status": "healthy"}` unconditionally. A load balancer or Kubernetes readiness probe relying on this will route traffic to a pod with a broken MongoDB connection.
 
 **Required:**
 ```python
 @router.get("/health")
 async def health_check():
     try:
-        # Ping any lightweight collection
         from mongoengine.connection import get_connection
         get_connection("development").server_info()
         db_status = "connected"
@@ -161,7 +194,7 @@ async def health_check():
 
 ---
 
-### 4.4 `datetime.utcnow()` Deprecated
+### ⏳ 4.4 `datetime.utcnow()` Deprecated — OPEN
 **Files:** `mongodb_db/schemas.py`, `services/prompt.py`
 
 `datetime.utcnow()` has been deprecated since Python 3.12. It returns a naïve datetime with no timezone info, which causes ambiguity in any multi-timezone deployment.
@@ -170,78 +203,77 @@ async def health_check():
 
 ---
 
-### 4.5 `CommitPromptRequest` Has Redundant `labels` Field
+### ⏳ 4.5 `CommitPromptRequest` Has Redundant `labels` Field — OPEN
 **File:** `schemas/requests/commit.py`
 
-`CommitPromptRequest` has both `labels: List[str]` at the top level AND `metadata: PromptMetadataSchema` which contains `label: List[str]`. It is unclear which one is the source of truth. `ValidationService.resolve_commit_data` uses `request.metadata.model_dump()` which carries `label`, not `labels`. The top-level `labels` field is never used.
+`CommitPromptRequest` has both `labels: List[str]` at the top level AND `metadata: PromptMetadataSchema` which contains `label: List[str]`. `ValidationService.resolve_commit_data` uses `request.metadata.model_dump()` which carries `label`. The top-level `labels` field is validated but not used in persistence.
 
-**Required:** Remove `labels` from `CommitPromptRequest`. The canonical source is `metadata.label`.
+**Note:** A validator was added on `labels` to enforce non-empty values, which is good. But the canonical storage path still uses `metadata.label`. The two fields can diverge silently.
+
+**Required:** Remove `labels` from `CommitPromptRequest` and enforce the non-empty rule on `metadata.label` directly. The canonical source should be one field only.
 
 ---
 
-### 4.6 `_get_env_collections` Opens a New `MongoClient` on Every Call
+### ⏳ 4.6 `_get_env_collections` Opens a New `MongoClient` on Every Call — OPEN
 **File:** `services/prompt.py`
 
-`_get_env_collections` and `_ensure_collection_ttl` each create a raw `MongoClient` independently of the MongoEngine connection pool. Every search across collections (the default code path when `prompt_handle` is not provided) opens a new TCP connection.
+`_get_env_collections` and `_ensure_collection_ttl` each create a raw `MongoClient` independently of the MongoEngine connection pool. Every cross-collection search opens a new TCP connection.
 
-**Required:** Cache the `MongoClient` or use the MongoEngine connection: `from mongoengine.connection import get_db`. This also applies to the DB-level client in `DatabaseConfig`.
+**Required:** Cache the `MongoClient` or use `from mongoengine.connection import get_db`.
 
 ---
 
-### 4.7 `read_prompt` Doesn't Filter by Tenant
+### ⏳ 4.7 `read_prompt` Doesn't Filter by Tenant — OPEN
 **File:** `services/prompt.py`
 
-`read_prompt` queries only by `prompt_handle`, `sub_agent`, and `version`. `tenant_id` and `tenant_feature` from `ReadPromptRequest` are not used in the query — only in the error fallback. A caller can read any prompt in any collection by knowing the handle.
+`read_prompt` queries only by `prompt_handle`, `sub_agent`, and `version`. `tenant_id` and `tenant_feature` from `ReadPromptRequest` are only used in the error fallback. Any caller can read any prompt in any collection by knowing the handle.
 
-**Required:** Add `metadata__tenant_id=tenant_id, metadata__tenant_feature=tenant_feature` to the query, or document explicitly that this is a trusted-caller-only API.
-
----
-
-### 4.8 Delete Does Not Require Version — Can Be Called Without It
-**File:** `services/prompt.py` — `delete_prompt`
-
-`DeletePromptRequest.version` is `Optional[int]`. The service returns a soft error if missing. But the endpoint signature accepts a request with no version, which is a dangerous footgun. In production, an accidental delete request with no version should be rejected at input validation, not returned as a soft-failure dict.
-
-**Required:** Make `version: int` required on `DeletePromptRequest`, or change `delete_prompt` to delete all versions when none is provided but add an explicit `delete_all: bool = False` guard field.
+**Required:** Add `metadata__tenant_id=tenant_id, metadata__tenant_feature=tenant_feature` to the query, or document explicitly that this is a trusted-caller-only internal API.
 
 ---
 
 ## 5. Medium Priority Issues — Address Within a Cycle (P2)
 
-### 5.1 No Tests
+### ✅ 5.7 Audit Log Write Coverage — PARTIALLY IMPROVED
+**File:** `services/prompt.py`, `mongodb_db/audit.py`
 
-Zero test files exist. No unit tests, no integration tests, no contract tests. With dynamic MongoEngine models, cache state, and complex version logic, regressions are nearly impossible to detect without tests.
+**What was done:** A new `create_audit_log_model` creates a central `operation_audit_log` collection per environment. Every operation — commit, save, read, search, update, delete, versions — now writes one audit entry with `operation`, `user_email`, `prompt_handle`, `environment`, `version`, `status`, `duration_ms`, `detail`, and `error`. Audit failures are caught and logged at `WARNING` level so they never crash the main operation.
+
+**Remaining gap:** The delete operation is still non-transactional — the legacy deletion log is written before the document is deleted. If the delete fails after the log write, the audit log contains a phantom deletion. Full transactional safety requires MongoDB 4.0+ multi-document transactions.
+
+---
+
+### ⏳ 5.1 No Tests — OPEN
+
+Zero test files exist. No unit tests, no integration tests, no contract tests.
 
 **Required:** At minimum:
-- Unit tests for `utils/helpers.py` (pure functions, trivial to test)
-- Unit tests for `schemas/validators.py`
+- Unit tests for `utils/helpers.py` and `schemas/validators.py` (pure functions, no DB needed)
 - Integration tests for `PromptService` against a real MongoDB (use `mongomock` or a Docker test container)
 - HTTP-level tests with FastAPI `TestClient`
+- Edge cases to cover: empty `prompt_data`, duplicate version race, unknown `prompt_handle`, cross-tenant reads, temp expiry, delete without version (now caught at schema), valid vs. invalid `prompt_handle` format
 
 ---
 
-### 5.2 Static Methods — No Dependency Injection
+### ⏳ 5.2 Static Methods — No Dependency Injection — OPEN
 **File:** `services/prompt.py`
 
-`PromptService` consists entirely of `@staticmethod` methods. This makes it impossible to:
-- Mock the service in tests without monkeypatching
-- Inject different DB connections per request (e.g., tenant-specific connection strings)
-- Profile or trace individual service calls via middleware
+`PromptService` consists entirely of `@staticmethod` methods. This makes it impossible to mock the service in tests without monkeypatching, inject different DB connections per request, or trace individual service calls via middleware.
 
-**Required:** Convert to a class with `__init__` or use FastAPI `Depends()` with a factory function. This doesn't need to be complex — a simple `get_prompt_service()` dependency is enough.
+**Required:** Convert to a class with `__init__` or use FastAPI `Depends()` with a factory function.
 
 ---
 
-### 5.3 Dynamic Model Cache Has No Eviction
+### ⏳ 5.3 Dynamic Model Cache Has No Eviction — OPEN
 **File:** `mongodb_db/schemas.py`
 
-`_ENV_MODEL_CACHE`, `_TEMP_MODEL_CACHE`, and `_LOG_MODEL_CACHE` grow indefinitely. In a long-running process with many unique `(prompt_handle, environment)` pairs, this is a memory leak.
+`_ENV_MODEL_CACHE`, `_TEMP_MODEL_CACHE`, `_LOG_MODEL_CACHE`, and `_AUDIT_CACHE` (new) all grow indefinitely. In a long-running process with many unique `(prompt_handle, environment)` pairs, this is a memory leak.
 
 **Required:** Use `functools.lru_cache` with a `maxsize` or a bounded LRU dict. A reasonable upper bound is 512 entries.
 
 ---
 
-### 5.4 `sys.path` Manipulation in `main.py`
+### ⏳ 5.4 `sys.path` Manipulation in `main.py` — OPEN
 **File:** `main.py`
 
 ```python
@@ -250,50 +282,27 @@ if _parent_dir not in sys.path:
     sys.path.insert(0, _parent_dir)
 ```
 
-This is a development workaround that indicates the package is not installed properly. In production Docker images, the working directory is set and the package is installed via `pip install -e .` or similar.
+This is a development workaround that indicates the package is not installed properly. In production Docker images, the working directory is set and the package is installed via `pip install -e .`.
 
-**Required:** Add a `pyproject.toml` (or `setup.py`) and install the package. Remove the `sys.path` manipulation.
+**Required:** Add a `pyproject.toml` and install the package. Remove the `sys.path` manipulation.
 
 ---
 
-### 5.5 `SearchPromptRequest.label` Is `Optional[str]` but Schema Stores `List[str]`
+### ⏳ 5.5 `SearchPromptRequest.label` Is `Optional[str]` but Schema Stores `List[str]` — OPEN
 **File:** `schemas/requests/search.py`
 
-The `label` filter accepts a single string but `PromptMetadataSchema.label` is a `List[str]`. Searching for a label stored as `["billing", "v2"]` with a single string `"billing"` uses MongoEngine's exact match, which won't work for list fields. This likely silently returns 0 results instead of failing visibly.
+The `label` filter accepts a single string but `PromptMetadataSchema.label` is a `List[str]`. Searching for `"billing"` in a stored list `["billing", "v2"]` uses exact match, which silently returns 0 results.
 
-**Required:** Change `label` in `SearchPromptRequest` to `Optional[List[str]]` and use MongoEngine's `in` operator (`metadata__label__in=label`) for the query.
-
----
-
-### 5.6 `commit_prompt` Leaks `is_new_sub_agent` Flag in the Response
-**File:** `api/routers.py`, `schemas/responses/commit.py`
-
-`CommitResponseSchema.is_new_sub_agent` is internal implementation state that the caller doesn't need for correct usage. Exposing it creates a contract where callers may start depending on it.
-
-**Suggestion:** Move this info into `CommitResponseSchema.info` as a human-readable string. Or keep it as `Optional[bool]` but document it as advisory.
+**Required:** Change `label` in `SearchPromptRequest` to `Optional[List[str]]` and use MongoEngine's `in` operator (`metadata__label__in=label`).
 
 ---
 
-### 5.7 Audit Log Write Is Not Transactional With Delete
-**File:** `services/prompt.py` — `delete_prompt`
+### ⏳ 5.6 `description` and `tags` Missing from Response Schema — OPEN
+**File:** `schemas/responses/create.py`
 
-```python
-create_log_model(...)(...).save()   # Write audit log
-prompt_to_delete.delete()           # Delete the prompt
-```
+`format_prompt_response` returns `description` and `tags` but `CreateResponseSchema` doesn't declare them. FastAPI strips them during response serialization.
 
-If the audit log write fails, the prompt is not deleted (good). But if the log write succeeds and the delete fails, the audit log contains a phantom deletion. If the delete succeeds and the log write had an exception that was swallowed (§3.2), there is no audit trail for the deletion.
-
-**Required:** Wrap in a try/except that rolls back or re-raises. MongoDB 4.0+ supports multi-document transactions — consider using them here.
-
----
-
-### 5.8 `format_prompt_response` Does Not Include `description` and `tags`
-**File:** `utils/helpers.py`, `schemas/responses/create.py`
-
-`format_prompt_response` returns `description` and `tags` fields, but `CreateResponseSchema` does not declare them. They will be silently stripped by FastAPI's response serialization when the response model is applied. This loses data the caller might need.
-
-**Required:** Add `description: Optional[str]` and `tags: Optional[Dict[str, Any]]` to `CreateResponseSchema`, or remove them from `format_prompt_response`.
+**Required:** Add `description: Optional[str]` and `tags: Optional[Dict[str, Any]]` to `CreateResponseSchema`.
 
 ---
 
@@ -333,49 +342,55 @@ No rate limiting on any endpoint. A runaway client can exhaust the thread pool a
 
 ## 7. Summary Priority Table
 
-| ID | Area | Severity | Effort |
-|----|------|----------|--------|
-| 3.1 | Authentication / Authorisation | P0 | Medium |
-| 3.2 | Silent exception swallowing | P0 | Low |
-| 3.3 | No structured logging | P0 | Low |
-| 3.4 | Cross-tenant data collision | P0 | Medium |
-| 3.5 | Version assignment race condition | P0 | Medium |
-| 3.6 | Error details leaked to callers | P0 | Low |
-| 3.7 | `save` accepts `None` user_id | P0 | Low |
-| 4.1 | No pagination | P1 | Low |
-| 4.2 | Health check doesn't ping DB | P1 | Low |
-| 4.3 | Stale `router.py` file | P1 | Trivial |
-| 4.4 | `datetime.utcnow()` deprecated | P1 | Low |
-| 4.5 | Redundant `labels` on CommitRequest | P1 | Low |
-| 4.6 | MongoClient opened per call | P1 | Low |
-| 4.7 | `read_prompt` not tenant-scoped | P1 | Low |
-| 4.8 | Delete accepts missing version | P1 | Low |
-| 5.1 | No tests | P2 | High |
-| 5.2 | Static methods / no DI | P2 | Medium |
-| 5.3 | Unbounded model cache | P2 | Low |
-| 5.4 | `sys.path` manipulation | P2 | Low |
-| 5.5 | `label` search type mismatch | P2 | Low |
-| 5.6 | `description`/`tags` not in response schema | P2 | Low |
-| 5.7 | Non-transactional audit log + delete | P2 | Medium |
-| F.1 | Async DB (motor/beanie) | Future | High |
-| F.2 | Event on commit | Future | High |
-| F.3 | Diff + rollback endpoints | Future | Medium |
-| F.4 | Prompt template schema validation | Future | High |
-| F.5 | Environment promotion API | Future | Medium |
-| F.6 | Per-tenant collection isolation | Future | High |
-| F.7 | Rate limiting + quotas | Future | Low |
+| ID | Area | Status | Severity | Effort |
+|----|------|--------|----------|--------|
+| 3.1 | Authentication / Authorisation | ⏳ Open | P0 | Medium |
+| 3.2 | Silent exception swallowing | ✅ Partial — errors now logged | P0 | Low |
+| 3.3 | No structured logging | ✅ Done — `utils/logger.py` + audit trail | P0 | Low |
+| 3.4 | Cross-tenant data collision | ✅ Done — query-level tenant scoping on all reads/writes | P0 | Medium |
+| 3.5 | Version assignment race condition | ⏳ Open | P0 | Medium |
+| 3.6 | Error details leaked to callers | ⏳ Open | P0 | Low |
+| 3.7 | `save` accepts `None` user_id | ⏳ Open | P0 | Low |
+| 4.1 | No pagination | ⏳ Open | P1 | Low |
+| 4.2 | Health check doesn't ping DB | ⏳ Open | P1 | Low |
+| 4.3 | Stale `router.py` file | ✅ Done — removed in prior session | P1 | Trivial |
+| 4.4 | `datetime.utcnow()` deprecated | ⏳ Open | P1 | Low |
+| 4.5 | Redundant `labels` on CommitRequest | ⏳ Open | P1 | Low |
+| 4.6 | MongoClient opened per call | ⏳ Open | P1 | Low |
+| 4.7 | `read_prompt` not tenant-scoped | ⏳ Open | P1 | Low |
+| 4.8 | Delete/update accept missing version | ✅ Done — `version: int ge=1` required | P1 | Low |
+| 5.1 | No tests | ⏳ Open | P2 | High |
+| 5.2 | Static methods / no DI | ⏳ Open | P2 | Medium |
+| 5.3 | Unbounded model cache | ⏳ Open | P2 | Low |
+| 5.4 | `sys.path` manipulation | ⏳ Open | P2 | Low |
+| 5.5 | `label` search type mismatch | ⏳ Open | P2 | Low |
+| 5.6 | `description`/`tags` not in response schema | ⏳ Open | P2 | Low |
+| 5.7 | Non-transactional audit log + delete | ✅ Partial — central audit log added | P2 | Medium |
+| F.1 | Async DB (motor/beanie) | ⏳ Future | Future | High |
+| F.2 | Event on commit | ⏳ Future | Future | High |
+| F.3 | Diff + rollback endpoints | ⏳ Future | Future | Medium |
+| F.4 | Prompt template schema validation | ⏳ Future | Future | High |
+| F.5 | Environment promotion API | ⏳ Future | Future | Medium |
+| F.6 | Per-tenant collection isolation | ⏳ Future | Future | High |
+| F.7 | Rate limiting + quotas | ⏳ Future | Future | Low |
 
 ---
 
 ## 8. Recommended Next Steps (Ordered)
 
-1. **Add authentication** (P0) — no code is worth shipping without this.
-2. **Add structured logging + fix silent exceptions** (P0 combo) — log every caught exception at `ERROR` level.
-3. **Fix tenant data isolation** (P0) — scope collection names and queries by `tenant_id`.
-4. **Fix version race condition** (P0) — use atomic MongoDB counter or retry on `NotUniqueError`.
-5. **Add pagination** (P1) — `limit`/`offset` on search and versions.
-6. **Delete stale `router.py`** (P1 trivial).
-7. **Fix `datetime.utcnow()`** (P1 low effort).
-8. **Fix `label` search type + add `description`/`tags` to response schema** (P2 low effort, group together).
-9. **Write integration tests** (P2) — establish a baseline before further refactoring.
-10. **Replace static methods with DI** (P2) — makes testing tractable.
+Steps already completed are struck through. Remaining work is ordered by risk reduction per unit of effort.
+
+1. ~~**Add structured logging + fix silent exceptions** (P0 combo)~~ — ✅ Done
+2. ~~**Delete stale `router.py`** (P1 trivial)~~ — ✅ Done
+3. ~~**Make version required on delete/update** (P1 low effort)~~ — ✅ Done
+4. **Fix `None` user_id on save** (P0 low effort) — make `user_email` required on `SaveTempPromptRequest` or default to `"anonymous"`.
+5. **Sanitise error messages returned to callers** (P0 low effort) — catch exceptions in router, log internally, return `"Internal error. See server logs."`.
+6. **Fix remaining silent swallows in helpers** (P0 low effort) — add `log_op(logger, logging.ERROR, ...)` in `_get_env_collections`, `_ensure_collection_ttl`, `_validate_sub_agent`.
+7. **Add authentication** (P0 medium effort) — no code is worth shipping without this.
+8. **Add pagination** (P1 low effort) — `limit`/`offset` on search and versions before data grows.
+9. **Fix `datetime.utcnow()`** (P1 low effort) — quick sweepable change.
+10. **Fix `label` search type + add `description`/`tags` to response schema** (P2 low effort) — group together, 30 minutes of work.
+11. ~~**Fix tenant data isolation** (P0 medium effort)~~ — ✅ Done
+12. **Fix version race condition** (P0 medium effort) — atomic MongoDB counter or retry on `NotUniqueError`.
+13. **Write integration tests** (P2) — establish a baseline before further refactoring.
+14. **Replace static methods with DI** (P2) — makes testing tractable.
